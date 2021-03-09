@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package grpc_image_processor;
+option go_package = "./pb";
+
+message UploadMatRequest {
+    int32 rows = 1;
+    int32 cols = 2;
+    int32 elt_type = 3;
+    bytes mat_data = 4;
+}
+
+message UploadMatResponse {
+    int32 rows = 1;
+    int32 cols = 2;
+    int32 elt_type = 3;
+    bytes mat_data = 4;
+}
+
+service ImageProcessor {
+    rpc DetectFaces(stream UploadMatRequest) returns (stream UploadMatResponse);
+}

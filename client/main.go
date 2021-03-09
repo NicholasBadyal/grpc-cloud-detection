@@ -1,25 +1,23 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"fmt"
 	"gocv.io/x/gocv"
 	"google.golang.org/grpc"
-	pb "grpc-cloud-detection/client/v1/pb"
-	"image"
+	"grpc-cloud-detection/client/v1/pb"
 	"io"
 	"log"
 	"time"
 )
 
-func CaptureImage(c pb.ImageProcessorClient) {
+func DetectFromCamera(c pb.ImageProcessorClient) error {
+	// setup visual components
 	camera, err := gocv.VideoCaptureDevice(0)
 	if err != nil {
 		log.Fatalf("failed to open camera: %v", err)
 	}
 	defer camera.Close()
-
-	camera.Set(gocv.VideoCaptureFrameHeight, 64)
 
 	window := gocv.NewWindow("Passed")
 	defer window.Close()
@@ -27,131 +25,95 @@ func CaptureImage(c pb.ImageProcessorClient) {
 	img := gocv.NewMat()
 	defer img.Close()
 
-	frames := 0
-	start := time.Now()
-	for {
-		for i := 0; i < 100; i++ {
-			ok := camera.Read(&img)
-			if !ok {
-				return
-			}
-			if img.Empty() {
-				continue
-			}
-
-			//window.IMShow(img)
-
-			image, err := img.ToImage()
-			if err != nil {
-				log.Printf("frame dropped: %v", err)
-				continue
-			}
-
-			bounds := image.Bounds()
-			x, y := bounds.Dx(), bounds.Dy()
-			bytes := make([]byte, 0, x*y)
-			for j := bounds.Min.Y; j < bounds.Max.Y; j++ {
-				for i := bounds.Min.X; i < bounds.Max.X; i++ {
-					r, g, b, a := image.At(i, j).RGBA()
-					bytes = append(bytes, byte(b>>8))
-					bytes = append(bytes, byte(g>>8))
-					bytes = append(bytes, byte(r>>8))
-					bytes = append(bytes, byte(a>>8))
-				}
-			}
-
-			uploadedBytes := UploadImage(c, bytes, bounds)
-			mat, err := gocv.NewMatFromBytes(y, x, gocv.MatTypeCV8UC4, uploadedBytes)
-			if err != nil {
-				continue
-			}
-			window.IMShow(mat)
-			frames++;
-
-			if window.WaitKey(1) >= 0 {
-				break
-			}
-		}
-		log.Printf("fps: %v", float64(frames) / time.Since(start).Seconds())
-	}
-
-}
-
-func UploadImage(c pb.ImageProcessorClient, content []byte, bounds image.Rectangle) []byte{
+	// open stream to RPC
 	stream, err := c.DetectFaces(context.Background())
 	if err != nil {
-		log.Fatalf("error while calling Passthrough: %v", err)
+		return fmt.Errorf("error while calling DetectFaces RPC: %v", err)
 	}
 
-	waitc := make(chan bytes.Buffer)
+	// channels for mats
+	matsToSend := make(chan gocv.Mat, 20)
+	matsToDisplay := make(chan gocv.Mat, 20)
 
-	// send go routine
+	// goroutine receives response from server and creates mats to display
 	go func() {
-
-		boundaries := &pb.UploadImageRequest{
-			Data: &pb.UploadImageRequest_Bounds{
-				Bounds: &pb.ImageBounds{
-					MinX: int64(bounds.Min.X),
-					MinY: int64(bounds.Min.Y),
-					MaxX: int64(bounds.Max.X),
-					MaxY: int64(bounds.Max.Y),
-				},
-			},
-		}
-
-		err := stream.Send(boundaries)
-		if err != nil {
-			log.Printf("failed to upload bounds: %v", err)
-			stream.CloseSend()
-			return
-		}
-
-		size := 1024
-		chunk := make([]byte, 1024)
-		for len(content) >= size {
-			chunk, content = content[:size], content[size:]
-			err := stream.Send(&pb.UploadImageRequest{Data: &pb.UploadImageRequest_DataChunk{DataChunk: chunk}})
-			if err != nil {
-				log.Printf("failed to upload image: %v", err)
-				stream.CloseSend()
-				return
-			}
-		}
-		if len(content) > 0 {
-			chunk = content[:]
-			err := stream.Send(&pb.UploadImageRequest{Data: &pb.UploadImageRequest_DataChunk{DataChunk: chunk}})
-			if err != nil {
-				log.Printf("failed to upload image: %v", err)
-				stream.CloseSend()
-				return
-			}
-		}
-		stream.CloseSend()
-	}()
-
-	// recv go routine
-	go func() {
-		img := bytes.Buffer{}
 		for {
 			res, err := stream.Recv()
 			if err == io.EOF {
+				log.Print("no more responses")
 				break
 			}
 			if err != nil {
-				log.Fatalf("error while reading upload image server stream: %v", err)
+				log.Printf("failed to receive stream response: %v", err)
 				break
 			}
 
-			_, err = img.Write(res.GetDataChunk())
+			newMat, err := gocv.NewMatFromBytes(int(res.GetRows()), int(res.GetCols()), gocv.MatType(res.EltType), res.GetMatData())
+			if err != nil {
+				log.Printf("failed to create mat from bytes: %v", err)
+				continue
+			}
+
+			matsToDisplay <- newMat
 		}
-
-		//log.Printf("bytes received: %v", img.Len())
-
-		waitc<- img
 	}()
 
-	img :=  <-waitc
-	return img.Bytes()
+	// goroutine sends request to server
+	go func() {
+		for {
+			img := <-matsToSend
+
+			data, err := img.DataPtrUint8()
+
+			if err != nil {
+				log.Printf("failed to collect mat data: %v", err)
+				break
+			}
+
+			mat := &pb.UploadMatRequest{
+				Rows:    int32(img.Rows()),
+				Cols:    int32(img.Cols()),
+				EltType: int32(img.Type()),
+				MatData: data,
+			}
+
+			err = stream.Send(mat)
+			if err != nil {
+				log.Printf("failed to send request: %v - %v", err, stream.RecvMsg(nil))
+				break
+			}
+		}
+		_ = stream.CloseSend()
+	}()
+
+	// displays mats and controls window
+	frames := 0
+	start := time.Now()
+	for {
+		ok := camera.Read(&img)
+		if !ok {
+			return fmt.Errorf("failed to read image from camera: %v", err)
+		}
+		if img.Empty() {
+			continue
+		}
+
+		matsToSend <- img
+
+		mat := <-matsToDisplay
+		frames++
+
+		window.IMShow(mat)
+
+		if window.WaitKey(1) >= 0 {
+			break
+		}
+
+		log.Printf("fps: %.4v\ttotal frames: %v", float64(frames)/time.Since(start).Seconds(), frames)
+	}
+
+	return nil
+
 }
 
 func main() {
@@ -159,9 +121,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("could not connect: %v", err)
 	}
-	defer conn.Close()
 
 	c := pb.NewImageProcessorClient(conn)
 
-	CaptureImage(c)
+	if err = DetectFromCamera(c); err != nil {
+		log.Fatalf("failed to DetectFromCamera: %v", err)
+	}
+
+	if err = conn.Close(); err != nil {
+		log.Fatalf("failed to close connection to server: %v", err)
+	}
+
+	log.Printf("Client closed")
 }

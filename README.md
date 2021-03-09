@@ -1,4 +1,4 @@
-#gRPC Cloud Detection
+# gRPC GoCV Face Detection
 
 Exploration of uploading images via gRPC for facial detection in go.
 
